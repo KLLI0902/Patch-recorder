@@ -101,7 +101,7 @@ def fetch_validation_emails(service: Any) -> list[dict[str, str]]:
 
     Returns a list of dicts with keys: id, subject, body.
     """
-    query = f"subject:{config.KEYWORD}"
+    query = f"subject:({config.KEYWORD} OR {config.EOL_KEYWORD})"
     results: list[dict[str, str]] = []
 
     try:
@@ -130,7 +130,7 @@ def fetch_validation_emails(service: Any) -> list[dict[str, str]]:
     except HttpError as exc:
         logger.error("Gmail API error while fetching messages: %s", exc)
         raise
-
+    logger.info("Fetched %d emails from Gmail query", len(results))
     return results
 
 
@@ -148,7 +148,7 @@ def process_inbox() -> int:
         emails = fetch_validation_emails(service)
 
         # Mark stale devices inactive before processing new data
-        stale_count = db.mark_stale_devices_inactive()
+        stale_count = db.update_device_status_by_age()
         if stale_count:
             logger.info("Marked %d device(s) as inactive (90-day rule)", stale_count)
 
@@ -161,6 +161,31 @@ def process_inbox() -> int:
             subject = email["subject"]
             body = email["body"]
 
+            # =========================
+            # ⭐ EOL 处理（新增）
+            # =========================
+            subject_upper = subject.upper()
+
+            if "EOL CONFIRMED" in subject_upper:
+                logger.info("EOL email detected: %s", subject)
+
+                device_name = subject.split("]")[0].replace("[", "").replace("[", "").strip()
+
+                db.mark_device_eol(device_name)
+
+                # ⭐ 这里加 event 记录（重点）
+                db.insert_event(
+                    device=device_name,
+                    version="EOL",
+                    raw_text=body,
+                )
+
+                db.mark_email_processed(msg_id)
+                continue
+
+            # =========================
+            # SW Validation 才继续走旧逻辑
+            # =========================
             if config.KEYWORD not in subject:
                 continue
 
@@ -215,47 +240,83 @@ def process_inbox() -> int:
     return processed_count
 
 
-def send_email(subject: str, html_body: str, to_email: str | None = None) -> bool:
+def send_email(
+    subject: str,
+    html_body: str,
+    to_email: str | list[str] | None = None,
+    cc_email: str | list[str] | None = None,
+) -> bool:
     """
     Send an HTML email via Gmail API.
-
-    Args:
-        subject: Email subject line.
-        html_body: HTML content for the email body.
-        to_email: Recipient address; defaults to config.TO_EMAIL.
-
-    Returns:
-        True if sent successfully, False otherwise.
     """
-    recipient = to_email or config.TO_EMAIL
 
     try:
         service = get_gmail_service()
 
+        # =========================
+        # Normalize recipients
+        # =========================
+        if to_email is None:
+            recipients = config.TO_EMAILS
+        elif isinstance(to_email, str):
+            recipients = [to_email]
+        else:
+            recipients = to_email
+
+        if cc_email is None:
+            cc_list = []
+        elif isinstance(cc_email, str):
+            cc_list = [cc_email]
+        else:
+            cc_list = cc_email
+
+            
+        recipients = [
+            r.strip()
+            for r in recipients
+            if r and r.strip() and "@" in r
+        ]
+
+        if not recipients:
+            raise ValueError("No valid recipients found")
+
+        # =========================
+        # Build message
+        # =========================
         message = MIMEMultipart("alternative")
-        message["to"] = recipient
-        message["from"] = config.EMAIL_USER
-        message["subject"] = subject
+
+        message["To"] = ", ".join(recipients)
+        if config.CC_EMAILS:
+            message["Cc"] = ", ".join(config.CC_EMAILS)
+
+        message["From"] = config.EMAIL_USER
+        message["Subject"] = subject
+
         message.attach(MIMEText(html_body, "html", "utf-8"))
 
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        raw = base64.urlsafe_b64encode(
+            message.as_bytes()
+        ).decode("utf-8")
 
+        # =========================
+        # Send
+        # =========================
         service.users().messages().send(
             userId="me",
             body={"raw": raw},
         ).execute()
 
-        logger.info("Report sent to %s", recipient)
+        logger.info("Report sent to %s", ", ".join(recipients))
         return True
 
     except HttpError as exc:
         logger.error("Gmail API error while sending email: %s", exc)
         return False
+
     except Exception as exc:
         logger.exception("Error sending email: %s", exc)
         return False
-
-
+        
 if __name__ == "__main__":
     """Run a one-shot Gmail inbox check (for testing). Use main.py for full agent."""
     import sys

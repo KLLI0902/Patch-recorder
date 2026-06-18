@@ -37,6 +37,19 @@ def _group_devices_by_type(
 
     return groups
 
+def _format_status(value: str) -> str:
+    value = value.upper()
+
+    if value == "UPDATED":
+        return f'<span style="color:green;font-weight:bold;">UPDATED</span>'
+
+    if value == "WAIT_FOR_UPDATE":
+        return f'<span style="color:red;font-weight:bold;">WAIT_FOR_UPDATE</span>'
+
+    if value == "EOL":
+        return ""  # 或者不显示
+
+    return f'<span style="color:gray;">{escape(value)}</span>'
 
 def _format_last_update(value: str | None) -> str:
     """Format an ISO datetime string for display."""
@@ -56,35 +69,30 @@ def generate_html_report() -> str:
     Groups: Tablet, Phone, Others.
     Columns: Device, Version, Status, Last Update.
     """
-    devices = db.get_active_devices()
+    devices = db.get_report_devices()
     groups = _group_devices_by_type(devices)
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     sections: list[str] = []
 
     for group_name in _TYPE_ORDER:
-        group_devices = groups.get(group_name, [])
+        group_devices = [
+            d for d in groups.get(group_name, [])
+            if d["status"].upper() != "EOL"
+        ]
         if not group_devices:
             continue
 
         rows: list[str] = []
         for dev in group_devices:
 
-            status = dev["status"]
-
-            if status == "updated":
-                status_html = f'<span style="color:green;font-weight:bold;">updated</span>'
-            elif status == "wait_for_updated":
-                status_html = f'<span style="color:red;font-weight:bold;">wait_for_updated</span>'
-            else:
-                status_html = f'<span style="color:gray;">{status}</span>'
-            
+        
             rows.append(
                 "<tr>"
                 f"<td>{escape(dev['device'])}</td>"
                 f"<td>{escape(dev['version'])}</td>"
                 f"<td>{escape(dev.get('patch', ''))}</td>"
-                f"<td>{status_html}</td>" 
+                f"<td>{_format_status(dev['status'])}</td>"
                 f"<td>{_format_last_update(dev.get('last_update'))}</td>"
                 "</tr>"
             )
@@ -147,18 +155,19 @@ def send_weekly_report() -> bool:
     logger.info("Weekly report generation started")
 
     try:
-        # Refresh inactive status before reporting
-        stale_count = db.mark_stale_devices_inactive()
+        # Refresh active status before reporting
+        stale_count = db.update_device_status_by_age()
         if stale_count:
             logger.info(
-                "Marked %d device(s) inactive before report", stale_count
+                "Marked %d device(s) active before report", stale_count
             )
 
         html = generate_html_report()
         success = send_email(
             subject=REPORT_TITLE,
             html_body=html,
-            to_email=config.TO_EMAIL,
+            to_email=config.TO_EMAILS,
+            cc_email=config.CC_EMAILS,
         )
 
         if success:
@@ -204,11 +213,12 @@ if __name__ == "__main__":
     )
 
     print("Weekly Report Tool")
-    print(f"  Recipient: {config.TO_EMAIL}")
+    print(f"  Recipients: {', '.join(config.TO_EMAILS)}")
+    print("DEBUG:", config.TO_EMAILS)
     print("-" * 50)
 
     db.init_db()
-    devices = db.get_active_devices()
+    devices = db.get_report_devices()
     groups = _group_devices_by_type(devices)
 
     print(f"Active devices: {len(devices)}")

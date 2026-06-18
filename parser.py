@@ -16,7 +16,7 @@ class FirmwareInfo:
     version: str
     patch: str
     md5: str
-    status: str = "active"
+    status: str
 
 
 # Subject: [TEST MODEL] SW Validation
@@ -135,7 +135,7 @@ def parse_firmware_email(subject: str, body: str) -> Optional[FirmwareInfo]:
         version=version,
         patch=patch,
         md5=md5,
-        status="active",
+        status="UPDATED",
     )
 
 

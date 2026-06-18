@@ -88,43 +88,62 @@ def upsert_device(
     version: str,
     patch: str,
     md5: str,
-    status: str,
     db_path: Path | None = None,
 ) -> bool:
     """
     Insert or update a device record.
 
-    Returns True if the device was updated, False if newly inserted.
+    Returns True if updated, False if new insert.
     """
+
     now = datetime.now().isoformat()
     conn = get_connection(db_path)
+
     try:
         existing = conn.execute(
-            "SELECT id FROM devices WHERE device = ?",
+            "SELECT status FROM devices WHERE device = ?",
             (device,),
         ).fetchone()
 
+        # 🧠 默认状态逻辑
         if existing:
+            # ❗如果已经 EOL，不允许被覆盖状态
+            if existing["status"] == "EOL":
+                conn.execute(
+                    """
+                    UPDATE devices
+                    SET version = ?, patch = ?, md5 = ?, last_update = ?
+                    WHERE device = ?
+                    """,
+                    (version, patch, md5, now, device),
+                )
+                conn.commit()
+                return True
+
+            # 🟡 正常更新 → UPDATED
             conn.execute(
                 """
                 UPDATE devices
-                SET type = ?, version = ?, patch = ?, md5 = ?, status = ?, last_update = ?
+                SET type = ?, version = ?, patch = ?, md5 = ?, status = 'UPDATED', last_update = ?
                 WHERE device = ?
                 """,
-                (device_type, version, patch, md5, status, now, device),
+                (device_type, version, patch, md5, now, device),
             )
             conn.commit()
             return True
 
+        # 🟢 新设备 → UPDATED
         conn.execute(
             """
             INSERT INTO devices (device, type, version, patch, md5, status, last_update)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'UPDATED', ?)
             """,
-            (device, device_type, version, patch, md5, status, now),
+            (device, device_type, version, patch, md5, now),
         )
+
         conn.commit()
         return False
+
     finally:
         conn.close()
 
@@ -150,24 +169,23 @@ def insert_event(
         conn.close()
 
 
-def mark_stale_devices_inactive(
+def update_device_status_by_age(
     inactive_days: int | None = None,
     db_path: Path | None = None,
 ) -> int:
     """
-    Set status to inactive for devices not updated within inactive_days.
-
-    Returns the number of devices marked inactive.
+    UPDATED -> WAIT_FOR_UPDATE if stale
     """
     days = inactive_days if inactive_days is not None else config.INACTIVE_DAYS
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
     conn = get_connection(db_path)
     try:
         cursor = conn.execute(
             """
             UPDATE devices
-            SET status = 'wait_for_updated'
-            WHERE status = 'updated'
+            SET status = 'WAIT_FOR_UPDATE'
+            WHERE status = 'UPDATED'
               AND last_update < ?
             """,
             (cutoff,),
@@ -177,20 +195,45 @@ def mark_stale_devices_inactive(
     finally:
         conn.close()
 
+def mark_device_eol(device: str, db_path: Path | None = None) -> None:
+    conn = get_connection(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE devices
+            SET status = 'EOL'
+            WHERE device = ?
+            """,
+            (device,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
-def get_active_devices(db_path: Path | None = None) -> list[dict[str, Any]]:
-    """Return all active devices ordered by type and device name."""
+def get_report_devices(db_path: Path | None = None) -> list[dict[str, Any]]:
+    """
+    Return devices for weekly report.
+
+    Only includes lifecycle-relevant devices:
+    - UPDATED
+    - WAIT_FOR_UPDATE
+
+    Excludes:
+    - EOL
+    """
     conn = get_connection(db_path)
     try:
         rows = conn.execute(
             """
             SELECT device, type, version, patch, md5, status, last_update
             FROM devices
-            WHERE status = 'active'
+            WHERE status IN ('UPDATED', 'WAIT_FOR_UPDATE')
             ORDER BY type, device
             """
         ).fetchall()
+
         return [dict(row) for row in rows]
+
     finally:
         conn.close()
 
