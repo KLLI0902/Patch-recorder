@@ -1,0 +1,26 @@
+# Runtime / secrets
+token.json
+.env
+
+# Database
+firmware.db
+
+# Logs
+logs/
+
+# Generated reports
+reports/
+
+# Python
+
+__pycache__/
+*.pyc
+*.pyo
+*.log
+venv/
+.env
+token.json
+credentials.json
+reports/
+.idea/
+.vscode/
